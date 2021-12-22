@@ -3,7 +3,7 @@ Description=RetroArch Tunnel Server
 After=network.target
 
 [Service]
-ExecStart=python -SOO /home/relay/netplay-tunnel-server/retroarch_tunnel_server.py
+ExecStart=python3 -SOO /home/relay/netplay-tunnel-server/retroarch_tunnel_server.py
 KillMode=process
 Restart=always
 RestartSec=5
