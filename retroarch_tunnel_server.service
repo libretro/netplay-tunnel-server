@@ -1,0 +1,15 @@
+[Unit]
+Description=RetroArch Tunnel Server
+After=network.target
+
+[Service]
+ExecStart=python -SOO /home/relay/netplay-tunnel-server/retroarch_tunnel_server.py
+KillMode=process
+Restart=always
+RestartSec=5
+Type=simple
+User=relay
+Group=relay
+
+[Install]
+WantedBy=multi-user.target
