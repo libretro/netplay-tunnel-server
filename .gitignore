@@ -1,0 +1,7 @@
+*.py[co]
+
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+*.log
