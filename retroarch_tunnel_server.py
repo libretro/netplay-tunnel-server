@@ -1,5 +1,5 @@
 #  RetroArch - A frontend for libretro.
-#  Copyright (C) 2021 - Roberto V. Rampim
+#  Copyright (C) 2021-2022 - Roberto V. Rampim
 #
 #  RetroArch is free software: you can redistribute it and/or modify it under the terms
 #  of the GNU General Public License as published by the Free Software Found-
@@ -27,6 +27,7 @@ import sys
 import os
 import enum
 import socket
+import ipaddress
 import asyncio
 import configparser
 
@@ -202,6 +203,7 @@ class TunnelError(Error):
 class TunnelMagic:
     SESSION: ClassVar[bytes] = b'RATS'
     LINK:    ClassVar[bytes] = b'RATL'
+    ADDRESS: ClassVar[bytes] = b'RATA'
     PING:    ClassVar[bytes] = b'RATP'
 
     @staticmethod
@@ -237,7 +239,7 @@ class Tunnel(ABC):
         pass
 
 class TunnelClient(Tunnel):
-    INVALID_UNIQUE: ClassVar[bytes] = bytes(bytearray(TunnelMagic.unique_size()))
+    INVALID_UNIQUE: ClassVar[bytes] = bytes(TunnelMagic.unique_size())
 
     __slots__ = ("_reader", "_writer", "_unique")
 
@@ -252,18 +254,13 @@ class TunnelClient(Tunnel):
         self._reader = reader
         self._writer = writer
 
-        self._unique = b""
+        self._unique = self.INVALID_UNIQUE
 
     def __del__(self) -> None:
         try:
             self._writer.close()
         except Exception:
             pass
-
-    @property
-    @abstractmethod
-    def session_owner(self) -> bool:
-        pass
 
     @property
     def address(self) -> str:
@@ -284,25 +281,47 @@ class TunnelClient(Tunnel):
 class SessionOwner(TunnelClient):
     __slots__ = ("__connected", "__ready")
 
-    __connected: int
+    __connected: Dict[bytes, TunnelClient]
 
     __ready: bool
 
     def __init__(self, config: Config, logger: Logger, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         super().__init__(config, logger, reader, writer)
 
-        self.__connected = 1 # Host counts as one.
+        self.__connected = {self.INVALID_UNIQUE: self} # Host counts as one.
 
         self.__ready = False
 
     def __bool__(self) -> bool:
         return self.__ready
 
-    @property
-    def session_owner(self) -> bool:
-        return True
+    async def __send_address(self, unique: bytes) -> bool:
+        # If unique is INVALID_UNIQUE, send the address of the session owner.
+        async with self._lock:
+            raw_addr: bytes
 
-    async def request_link(self, user: SessionUser) -> bool:
+            try:
+                addr: Union[ipaddress.IPv4Address, ipaddress.IPv6Address] = ipaddress.ip_address(self.__connected[unique].address)
+            except (KeyError, ValueError):
+                # If the requested client couldn't be found, send an invalid reply.
+                unique   = self.INVALID_UNIQUE
+                raw_addr = ipaddress.ip_address("::").packed
+            else:
+                if addr.version == 4:
+                    # For IPv4, we need to add a prefix.
+                    raw_addr = bytes(10) + bytes((0xff,0xff)) + addr.packed
+                else:
+                    raw_addr = addr.packed
+            finally:
+                try:
+                    self._writer.write(TunnelMagic.ADDRESS + unique + raw_addr)
+                    await self._writer.drain()
+                except Exception:
+                    return False
+                else:
+                    return True
+
+    async def request_link(self, client: SessionUserClient) -> bool:
         async with self._lock:
             if not self.__ready:
                 return False
@@ -313,26 +332,40 @@ class SessionOwner(TunnelClient):
             if self._writer.is_closing():
                 return False
 
-            if self._config.max_clients_per_session and self.__connected >= self._config.max_clients_per_session:
+            if self._config.max_clients_per_session and len(self.__connected) >= self._config.max_clients_per_session:
+                return False
+
+            client_unique: bytes = await client.unique()
+
+            if client_unique in self.__connected:
                 return False
 
             # Tell the host to establish a new link connection.
             try:
-                self._writer.write(TunnelMagic.LINK + await user.unique())
+                self._writer.write(TunnelMagic.LINK + client_unique)
                 await self._writer.drain()
             except Exception:
                 return False
             else:
-                self.__connected += 1
+                self.__connected[client_unique] = client
 
         return True
 
-    async def request_unlink(self) -> bool:
+    async def request_unlink(self, client: SessionUserClient) -> bool:
         async with self._lock:
             if not self.__ready:
                 return False
 
-            self.__connected -= 1
+            client_unique: bytes = await client.unique()
+
+            # Don't remove the session owner.
+            if client_unique == self.INVALID_UNIQUE:
+                return False
+
+            try:
+                del self.__connected[client_unique]
+            except KeyError:
+                return False
 
         return True
 
@@ -352,7 +385,7 @@ class SessionOwner(TunnelClient):
             while not self._reader.at_eof():
                 try:
                     # We want to request a ping every minute.
-                    data = await asyncio.wait_for(self._reader.readexactly(len(TunnelMagic.PING)), 60)
+                    data = await asyncio.wait_for(self._reader.readexactly(TunnelMagic.size()), 60)
                 except asyncio.TimeoutError:
                     # Attempt to ping the host a total of 3 times before timeouting.
                     if pings < 3:
@@ -368,11 +401,20 @@ class SessionOwner(TunnelClient):
                     if not data:
                         break
 
-                    # We received something, but we are only allowing for ping responses.
-                    if data == TunnelMagic.PING:
+                    if data == TunnelMagic.ADDRESS:
+                        # Do not wait for more than 30 seconds for the unique id.
+                        data = await asyncio.wait_for(self._reader.readexactly(TunnelMagic.unique_size()), 30)
+
+                        if not data:
+                            break
+
+                        if not await self.__send_address(data):
+                            await self.log_error(f"Failed to send requested address for: {self.address}|{self.port}")
+                            break
+                    elif data == TunnelMagic.PING:
                         pings = 0
                     else:
-                        await self.log_error(f"Tunnel session received non-ping data for: {self.address}|{self.port}")
+                        await self.log_error(f"Tunnel session received unknown data for: {self.address}|{self.port}")
                         break
         except Exception:
             pass
@@ -383,24 +425,15 @@ class SessionOwner(TunnelClient):
         await self.log_info(f"Tunnel session closed for: {self.address}|{self.port}")
 
 class SessionUser(TunnelClient):
-    __slots__ = (
-        "__host",
-        "__owner",
-        "__link",
-        "__linked"
-    )
-
-    __host: bool
+    __slots__ = ("__owner", "__link", "__linked")
 
     __owner: Optional[SessionOwner]
 
     __link:   Optional[SessionUser]
     __linked: asyncio.Event
 
-    def __init__(self, config: Config, logger: Logger, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: bool = False):
+    def __init__(self, config: Config, logger: Logger, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         super().__init__(config, logger, reader, writer)
-
-        self.__host = host
 
         self.__owner = None
 
@@ -421,14 +454,6 @@ class SessionUser(TunnelClient):
         else:
             return True
 
-    @property
-    def session_owner(self) -> bool:
-        return False
-
-    @property
-    def is_host(self) -> bool:
-        return self.__host
-
     async def owner(self) -> Optional[SessionOwner]:
         async with self._lock:
             return self.__owner
@@ -443,26 +468,24 @@ class SessionUser(TunnelClient):
         if owner is None:
             return False
 
-        async with owner._lock:
-            async with self._lock:
-                async with link._lock:
-                    if self.__link is not None or link.__link is not None:
-                        return False
+        async with owner._lock, self._lock, link._lock:
+            if self.__link is not None or link.__link is not None:
+                return False
 
-                    if self.__linked.is_set() or link.__linked.is_set():
-                        return False
+            if self.__linked.is_set() or link.__linked.is_set():
+                return False
 
-                    if self._reader.at_eof() or link._reader.at_eof():
-                        return False
+            if self._reader.at_eof() or link._reader.at_eof():
+                return False
 
-                    if self._writer.is_closing() or link._writer.is_closing():
-                        return False
+            if self._writer.is_closing() or link._writer.is_closing():
+                return False
 
-                    self.__link = link
-                    link.__link = self
+            self.__link = link
+            link.__link = self
 
-                    self.__linked.set()
-                    link.__linked.set()
+            self.__linked.set()
+            link.__linked.set()
 
         return True
 
@@ -472,16 +495,15 @@ class SessionUser(TunnelClient):
         if owner is None:
             return False
 
-        async with owner._lock:
-            async with self._lock:
-                link: Optional[SessionUser] = self.__link
+        async with owner._lock, self._lock:
+            link: Optional[SessionUser] = self.__link
 
-                if link is None:
-                    return False
+            if link is None:
+                return False
 
-                async with link._lock:
-                    self.__link = None
-                    link.__link = None
+            async with link._lock:
+                self.__link = None
+                link.__link = None
 
         return True
 
@@ -511,11 +533,11 @@ class SessionUser(TunnelClient):
                         break
 
                     async with self._lock:
-                        # Check if our link is still around.
                         link = self.__link
 
-                        if link is None:
-                            break
+                    # Check if our link is still around.
+                    if link is None:
+                        break
 
                     if not await link.__forward(data):
                         await self.log_error(f"Failed to forward data from: {self.address}|{self.port}")
@@ -524,6 +546,12 @@ class SessionUser(TunnelClient):
                 pass
 
         await self.log_info(f"Tunnel closed for: {self.address}|{self.port}")
+
+class SessionUserClient(SessionUser):
+    __slots__ = ()
+
+class SessionUserHost(SessionUser):
+    __slots__ = ()
 
 class TunnelServer(Tunnel):
     __slots__ = ("__clients", "__sessions")
@@ -580,10 +608,8 @@ class TunnelServer(Tunnel):
                 del self.__clients[await client.unique()]
             except KeyError:
                 await self.log_warn(f"Failed to remove client: {client.address}|{client.port}")
-            finally:
-                await client.set_unique(b"")
 
-    async def __session_link_request(self, user: SessionUser, session_id: bytes) -> Optional[SessionOwner]:
+    async def __session_link_request(self, user: SessionUserClient, session_id: bytes) -> Optional[SessionOwner]:
         unique: bytes = await user.unique()
 
         if session_id == unique:
@@ -595,17 +621,17 @@ class TunnelServer(Tunnel):
         except KeyError:
             return await self.log_error(f"Failed to find session for: {user.address}|{user.port}")
         else:
-            if not owner.session_owner:
+            if not isinstance(owner, SessionOwner):
                 return await self.log_error(f"Invalid session id from: {user.address}|{user.port}")
 
-            await user.set_owner(cast(SessionOwner, owner))
+            await user.set_owner(owner)
 
-            if not await cast(SessionOwner, owner).request_link(user):
+            if not await owner.request_link(user):
                return await self.log_error(f"Failed to establish tunnel link for: {user.address}|{user.port}")
 
-        return cast(SessionOwner, owner)
+        return owner
 
-    async def __session_link(self, user: SessionUser, peer_id: bytes) -> Optional[SessionUser]:
+    async def __session_link(self, user: SessionUserHost, peer_id: bytes) -> Optional[SessionUserClient]:
         unique: bytes = await user.unique()
 
         if peer_id == unique:
@@ -617,20 +643,20 @@ class TunnelServer(Tunnel):
         except KeyError:
             return await self.log_error(f"Failed to find peer for: {user.address}|{user.port}")
         else:
-            if peer.session_owner or cast(SessionUser, peer).is_host:
+            if not isinstance(peer, SessionUserClient):
                 return await self.log_error(f"Invalid peer id from: {user.address}|{user.port}")
 
-            owner: Optional[SessionOwner] = await cast(SessionUser, peer).owner()
+            owner: Optional[SessionOwner] = await peer.owner()
 
             if owner is None:
                 return await self.log_error(f"Invalid peer session owner for: {user.address}|{user.port}")
 
             await user.set_owner(owner)
 
-            if not await cast(SessionUser, peer).try_link(user):
+            if not await peer.try_link(user):
                 return await self.log_error(f"Failed to establish tunnel link for: {user.address}|{user.port}")
 
-        return cast(SessionUser, peer)
+        return peer
 
     async def __handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -654,7 +680,7 @@ class TunnelServer(Tunnel):
             if magic == b'RANP':
                 # Client does not support tunnels.
                 # Send a fake header to let it know it's outdated.
-                writer.write(b'RANP' + bytearray(20))
+                writer.write(b'RANP' + bytes(20))
                 await writer.drain()
 
                 return await self.log_error(f"Unsupported client from: {addr}|{port}")
@@ -667,7 +693,7 @@ class TunnelServer(Tunnel):
 
                 client: TunnelClient
                 owner:  Optional[SessionOwner]
-                peer:   Optional[SessionUser]
+                peer:   Optional[SessionUserClient]
 
                 if magic == TunnelMagic.SESSION:
                     if unique == TunnelClient.INVALID_UNIQUE:
@@ -681,7 +707,7 @@ class TunnelServer(Tunnel):
                             return await self.log_error(f"Refused to create tunnel session for: {addr}|{port}")
                     else:
                         # Client trying to link to an existing session.
-                        client = SessionUser(self._config, self._logger, reader, writer, host = False)
+                        client = SessionUserClient(self._config, self._logger, reader, writer)
                         await self.__add_client(client)
                         owner = await self.__session_link_request(client, unique)
 
@@ -692,7 +718,7 @@ class TunnelServer(Tunnel):
                             return await self.log_error(f"Tunnel linking failed for: {addr}|{port}")
                 else:
                     # Session host client trying to link to an user client.
-                    client = SessionUser(self._config, self._logger, reader, writer, host = True)
+                    client = SessionUserHost(self._config, self._logger, reader, writer)
                     await self.__add_client(client)
                     peer = await self.__session_link(client, unique)
 
@@ -705,16 +731,17 @@ class TunnelServer(Tunnel):
                         return await self.log_error(f"Tunnel linking failed for: {addr}|{port}")
 
                 await client()
+
                 await self.__remove_client(client)
 
-                if client.session_owner:
+                if isinstance(client, SessionOwner):
                     await self.__free_session()
                 else:
                     # Make sure to tell our link we are done for.
                     await cast(SessionUser, client).try_unlink()
 
-                    if not cast(SessionUser, client).is_host:
-                        await cast(SessionOwner, owner).request_unlink()
+                    if isinstance(client, SessionUserClient):
+                        await cast(SessionOwner, owner).request_unlink(client)
             else:                
                 return await self.log_error(f"Unknown tunnel magic from: {addr}|{port}")
         finally:
