@@ -627,7 +627,7 @@ class TunnelServer(Tunnel):
             await user.set_owner(owner)
 
             if not await owner.request_link(user):
-               return await self.log_error(f"Failed to establish tunnel link for: {user.address}|{user.port}")
+                return await self.log_error(f"Failed to establish tunnel link for: {user.address}|{user.port}")
 
         return owner
 
@@ -742,7 +742,7 @@ class TunnelServer(Tunnel):
 
                     if isinstance(client, SessionUserClient):
                         await cast(SessionOwner, owner).request_unlink(client)
-            else:                
+            else:
                 return await self.log_error(f"Unknown tunnel magic from: {addr}|{port}")
         finally:
             # Close the connection once we are done.
